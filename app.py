@@ -8,7 +8,7 @@ import numpy as np
 import streamlit as st
 from streamlit_drawable_canvas import st_canvas
 from PIL import Image
-import tensorflow as tf
+import tflite_runtime.interpreter as tflite
 
 # ── 設定 ────────────────────────────────────────────────────
 CATEGORIES = [
@@ -18,7 +18,7 @@ CATEGORIES = [
     {'name': 'ライオン', 'emoji': '🦁'},
     {'name': 'ワニ',     'emoji': '🐊'},
 ]
-MODEL_PATH = os.path.join(os.path.dirname(__file__), 'model', 'model.h5')
+MODEL_PATH = os.path.join(os.path.dirname(__file__), 'model', 'model.tflite')
 
 # ── ページ設定 ───────────────────────────────────────────────
 st.set_page_config(page_title='AI 動物判定', page_icon='🎨', layout='centered')
@@ -59,7 +59,9 @@ st.markdown("""
 def load_model():
     if not os.path.exists(MODEL_PATH):
         return None
-    return tf.keras.models.load_model(MODEL_PATH)
+    interpreter = tflite.Interpreter(model_path=MODEL_PATH)
+    interpreter.allocate_tensors()
+    return interpreter
 
 model = load_model()
 
@@ -114,7 +116,11 @@ with col_result:
         arr = (255 - np.array(img)) / 255.0
         arr = arr.reshape(1, 28, 28, 1).astype('float32')
 
-        probs = model.predict(arr, verbose=0)[0]
+        input_details  = model.get_input_details()
+        output_details = model.get_output_details()
+        model.set_tensor(input_details[0]['index'], arr)
+        model.invoke()
+        probs = model.get_tensor(output_details[0]['index'])[0]
         results = sorted(
             [{'name': CATEGORIES[i]['name'], 'emoji': CATEGORIES[i]['emoji'], 'prob': float(probs[i])}
              for i in range(len(CATEGORIES))],
