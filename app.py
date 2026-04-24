@@ -1,5 +1,5 @@
 """
-AI 動物判定 Streamlit アプリ
+AI 動物判定 Streamlit アプリ（numpy推論版）
 実行: streamlit run app.py
 """
 
@@ -8,7 +8,6 @@ import numpy as np
 import streamlit as st
 from streamlit_drawable_canvas import st_canvas
 from PIL import Image
-import tflite_runtime.interpreter as tflite
 
 # ── 設定 ────────────────────────────────────────────────────
 CATEGORIES = [
@@ -18,37 +17,56 @@ CATEGORIES = [
     {'name': 'ライオン', 'emoji': '🦁'},
     {'name': 'ワニ',     'emoji': '🐊'},
 ]
-MODEL_PATH = os.path.join(os.path.dirname(__file__), 'model', 'model.tflite')
+WEIGHTS_PATH = os.path.join(os.path.dirname(__file__), 'model', 'weights.npz')
+
+# ── numpy CNN 推論 ───────────────────────────────────────────
+def conv2d(x, w, b):
+    H, W, _ = x.shape
+    kH, kW, _, F = w.shape
+    oH, oW = H - kH + 1, W - kW + 1
+    shape   = (oH, oW, kH, kW, x.shape[2])
+    strides = (x.strides[0], x.strides[1], x.strides[0], x.strides[1], x.strides[2])
+    patches = np.lib.stride_tricks.as_strided(x, shape=shape, strides=strides)
+    return np.einsum('ijhwc,hwcf->ijf', patches, w) + b
+
+def maxpool2d(x, size=2):
+    H, W, C = x.shape
+    x = x[:H//size*size, :W//size*size, :]
+    return x.reshape(H//size, size, W//size, size, C).max(axis=(1, 3))
+
+def relu(x):
+    return np.maximum(0, x)
+
+def softmax(x):
+    e = np.exp(x - x.max())
+    return e / e.sum()
+
+def predict_numpy(img_arr, weights):
+    x = img_arr[0]                                          # (28,28,1)
+    x = relu(conv2d(x, weights['conv1_w'], weights['conv1_b']))  # (26,26,32)
+    x = maxpool2d(x)                                        # (13,13,32)
+    x = relu(conv2d(x, weights['conv2_w'], weights['conv2_b']))  # (11,11,64)
+    x = maxpool2d(x)                                        # (5,5,64)
+    x = relu(conv2d(x, weights['conv3_w'], weights['conv3_b']))  # (3,3,64)
+    x = x.flatten()                                         # (576,)
+    x = relu(x @ weights['dense1_w'] + weights['dense1_b'])  # (128,)
+    x = softmax(x @ weights['dense2_w'] + weights['dense2_b'])  # (5,)
+    return x
 
 # ── ページ設定 ───────────────────────────────────────────────
 st.set_page_config(page_title='AI 動物判定', page_icon='🎨', layout='centered')
 
 st.markdown("""
 <style>
-  /* HeaderSpace / PageTitleArea */
   .block-container { padding-top: 56px !important; }
   h1 { font-size: 20pt !important; }
-
-  /* ボタン（Primary: Success #34E87D / Secondary: ボーダー） */
   div.stButton > button[kind="primary"] {
-    background: #34E87D;
-    color: #0f172a;
-    border: none;
-    border-radius: 6px;
-    height: 60px;
-    font-size: 14px;
-    font-weight: 700;
-    width: 100%;
+    background: #34E87D; color: #0f172a; border: none;
+    border-radius: 6px; height: 60px; font-size: 14px; font-weight: 700; width: 100%;
   }
   div.stButton > button[kind="secondary"] {
-    background: #ffffff;
-    color: #475569;
-    border: 1.5px solid #cbd5e1;
-    border-radius: 6px;
-    height: 38px;
-    font-size: 14px;
-    font-weight: 700;
-    width: 100%;
+    background: #ffffff; color: #475569; border: 1.5px solid #cbd5e1;
+    border-radius: 6px; height: 38px; font-size: 14px; font-weight: 700; width: 100%;
   }
   div.stButton > button:hover { opacity: 0.82; }
 </style>
@@ -56,24 +74,21 @@ st.markdown("""
 
 # ── モデル読み込み ───────────────────────────────────────────
 @st.cache_resource
-def load_model():
-    if not os.path.exists(MODEL_PATH):
+def load_weights():
+    if not os.path.exists(WEIGHTS_PATH):
         return None
-    interpreter = tflite.Interpreter(model_path=MODEL_PATH)
-    interpreter.allocate_tensors()
-    return interpreter
+    return dict(np.load(WEIGHTS_PATH))
 
-model = load_model()
+weights = load_weights()
 
 # ── UI ──────────────────────────────────────────────────────
 st.title('🎨 AI 動物判定')
 st.caption('キリン・うさぎ・ぞう・ライオン・ワニを認識します')
 
-if model is None:
-    st.error('model/model.h5 が見つかりません。先に `python train.py` を実行してください。')
+if weights is None:
+    st.error('model/weights.npz が見つかりません。')
     st.stop()
 
-# 消すボタン用カウンター（キーを変えてキャンバスを強制リセット）
 if 'clear_count' not in st.session_state:
     st.session_state.clear_count = 0
 
@@ -88,8 +103,7 @@ with col_input:
         stroke_width=7,
         stroke_color='#111111',
         background_color='#ffffff',
-        width=280,
-        height=280,
+        width=280, height=280,
         drawing_mode='freedraw',
         key=f'canvas_{st.session_state.clear_count}',
     )
@@ -110,17 +124,12 @@ with col_result:
                 unsafe_allow_html=True)
 
     if predict_btn and canvas.image_data is not None:
-        # 前処理: グレースケール → 28x28 → 反転 → 正規化
         img = Image.fromarray(canvas.image_data.astype('uint8')).convert('L')
         img = img.resize((28, 28))
         arr = (255 - np.array(img)) / 255.0
         arr = arr.reshape(1, 28, 28, 1).astype('float32')
 
-        input_details  = model.get_input_details()
-        output_details = model.get_output_details()
-        model.set_tensor(input_details[0]['index'], arr)
-        model.invoke()
-        probs = model.get_tensor(output_details[0]['index'])[0]
+        probs = predict_numpy(arr, weights)
         results = sorted(
             [{'name': CATEGORIES[i]['name'], 'emoji': CATEGORIES[i]['emoji'], 'prob': float(probs[i])}
              for i in range(len(CATEGORIES))],
@@ -128,7 +137,6 @@ with col_result:
         )
         top = results[0]
 
-        # 1位表示
         st.markdown(f"""
         <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;
                     padding:16px;text-align:center;margin-bottom:12px;">
@@ -138,7 +146,6 @@ with col_result:
         </div>
         """, unsafe_allow_html=True)
 
-        # バー表示
         for i, r in enumerate(results):
             pct = r['prob'] * 100
             bar_color = 'linear-gradient(90deg,#34E87D,#B752E2)' if i == 0 else '#cbd5e1'
